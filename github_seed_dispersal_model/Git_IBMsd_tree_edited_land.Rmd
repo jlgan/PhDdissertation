@@ -1,0 +1,308 @@
+---
+title: "IBMsd_tree_edited_land"
+author: "JLG"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+#SET UP
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+rm(list = ls())
+
+library(raster)
+library(dplyr)
+library(tidyselect)
+library(data.table)
+library(sf)
+library(sp)
+library(ggplot2)
+library(spatstat)
+library(ggpubr)
+library(RColorBrewer)
+library(ggnewscale)
+
+library(amt)
+library(tidyverse)
+library(terra)
+
+library(adehabitatHR)
+
+library(flextable)
+library(lhs)
+library(ppcor)
+library(pwr)
+
+# load packages
+library(spatstat)
+library(tidyverse)
+library(raster)
+library(RColorBrewer) 
+library(sp)
+library(geostatsp)
+library(sf)
+
+
+source("ibm_functions.R")
+
+
+# find critical value of rho
+critical.r <- function(n, alpha=0.05, spearman=FALSE) {
+  df <- n - 2
+  critical.t <- qt(alpha/2, df, lower.tail = F)
+  
+  if(spearman) {
+    critical.r <- sqrt(((critical.t^2) / (df)) + 1)
+  } else {
+    critical.r <- sqrt( (critical.t^2) / ( (critical.t^2) + df ) )
+  }
+  
+  return(critical.r)
+}
+
+# return highest rho of parameter set
+check_cor <- function(x) {
+  y <- cor(x)
+  diag(y) <- 0
+  return(max(abs(y)))
+}
+
+fun <- function(x) { x + 1 }
+minus <- function(x) { x - 1 }
+
+```
+
+#TREE_EDITED actual landscape
+```{r treeedited_simulation}
+
+#set.seed(rs <- sample(1e6,1))
+
+#load data
+pred_dist_tree = readRDS("data/predicted_distribution_large_edited")
+k_m3 = readRDS("data/ISSFkernel")
+
+e <- extent(395050.1, 403062.4  , 1866160 , 1872667) 
+hab.raster <- raster("data/edited_clipped_movhab_larger.tif") %>% crop(e)
+names(hab.raster) = "hab"
+test_spdf <- as(hab.raster, "SpatialPixelsDataFrame")
+test_df <- as.data.frame(test_spdf)
+
+#parameters
+n_sim <- 80 # number of simulations
+n_steps = (28*14) #28 time points per day; 196 is 7 days; 392 for two weeks
+bird_count <- 1  # number of birds
+dist = 10   # distance of buffer (perception range of the birds)
+mean_crop_size = 50 # Mean fruits per tree
+srt_pois_lambda = 5.98 #lambda value of Poisson distribution for Seed Retention Time
+max_seed_removed = 26 #maximum number of seeds removed per visit or time step
+f = 0.5 # Angular frequency of the sine wave function
+phi=5.5 # Vertical shift of the sine wave function 
+
+percent_tokeep = c(0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0) #trees in the agricultural matrix
+
+
+#dataframes and lists
+sdd_out_list = list()
+seed_SRT_line = data.frame()
+movepath_list = list()
+gut_list = list()
+
+for (j in 1:length(percent_tokeep)) {
+  
+    for (s_run in 1:n_sim) {
+      
+      #patches set-up
+      combined_raster = set_raster(hab.raster)
+      patches = set_patches(combined_raster)
+      
+      #tree simulation
+      trees = simulate_trees(pred_dist_tree, combined_raster, mean_crop_size)
+      
+      #tree edits
+      trees %>%
+        left_join((patches %>% dplyr::select(-x, -y)), by = "p_id") -> trees_patches
+                
+      treeagri_sample(trees_patches, percent_tokeep[j]) -> trees #reduce the agri trees by 50%
+      
+  
+      #movement steps
+      move_steps = simulate_path.redistribution_kernel(k_m3, n.steps = n_steps) 
+      move_steps = step_hab(move_steps, combined_raster) #with habitat class now
+      move_steps$X = seq(1:nrow(move_steps))
+      move_steps$t_ = as.character(move_steps$t_)
+      
+      #reset bird data
+      birds <- data.frame(
+                          id = 1:bird_count,
+                          x = move_steps[1,]$x_,
+                          y = move_steps[1,]$y_,
+                          p_id = move_steps[1,]$p_id,
+                          energy = 5, 
+                          tick = 1,
+                          message = NA,
+                          seed_depo = NA
+                        )
+      
+      #reset dataframes and lists
+      gut =  data.frame(bird_id = NA,
+                        tick = NA,
+                        seed_eaten = NA,
+                        origintree_ID = NA,
+                        SRT = NA, 
+                        pID_seed_depo = NA, 
+                        tick_depo = NA
+                        )
+      
+      seed_SRT_line = data.frame()
+      
+    
+      #move-eat-poop procedures
+      for (i in 2:(n_steps)) {
+      
+        #staggered poop SRT timer
+        if (any((seed_SRT_line$SRT_perseed >= 0))) {
+          seed_SRT_line %>% 
+            mutate(SRT_perseed = ifelse((seed_SRT_line$SRT_perseed >= 0), 
+                                         SRT_perseed - 1, 
+                                        SRT_perseed))  ->  seed_SRT_line  #update the SRT for those seeds with SRT = 0 
+        }
+        
+        move_steps <- rest(max_seed_removed, move_steps, i)  #duplicates previous location if resting, based on rest probability
+        birds <- move(birds, i) #move procedure
+        list_fruit <- eatFruit(birds, trees, i, max_seed_removed)  #eat procedure
+        birds = list_fruit[[1]]
+        trees = list_fruit[[2]]
+        gut = list_fruit[[3]]
+        
+        seed_SRT_line = assign_GRT(seed_SRT_line, gut, i) 
+        
+        list_stagpoop <- staggered_poop(birds, seed_SRT_line, i) #staggered poop procedure
+        birds = list_stagpoop[[1]] 
+        seed_SRT_line = list_stagpoop[[2]]
+        
+        i = i + 1 
+      }
+      
+      #saving gut per simulation
+      gut_list[[n_run]] = gut
+      
+      #saving movement path per simulation
+      movepath_list[[n_run]] = move_steps[1:n_steps, ] %>% mutate(sim_num = s_run, percent_tree = percent_tokeep[j])
+    
+      #output saving for several simulation outputs
+      sim_out =  compute_sdd_treedit(seed_SRT_line, trees, patches) %>% mutate(percent_tree = percent_tokeep[j])
+
+      sdd_out_list[[n_run]] = sim_out
+
+      print(sdd_out_list)
+      print(paste0("simulation done: ", s_run, " percent_tree: ", percent_tokeep[j]))
+      
+      #plotting simulation
+      save_simplots(hab.raster, move_steps, trees, s_run, percent_tokeep)
+      
+      #save output **
+      #saveRDS(sdd_out_list, "R_out/in_simulation_sdd_out_list_end1.0")
+      #saveRDS(gut_list, "R_out/in_simulation_gut_list_end1.0")
+      #saveRDS(movepath_list, "R_out/in_simulation_movepath_list_end1.0")
+
+      s_run = s_run + 1
+      n_run = n_run + 1
+      
+    }
+  
+}
+
+
+gut_list
+#SDD  ***********************************************
+sdd_out_list
+same_sdd_out_df <- rbindlist(sdd_out_list) 
+as.numeric(same_sdd_out_df$distances) -> same_sdd_out_df$distances
+same_mean_sdd = mean(same_sdd_out_df$distances)
+
+
+#MOVEMENT  ***********************************************
+movepath_list #saving the movement path for all simulation runs
+movepath_df <- rbindlist(movepath_list) 
+
+#how frequent did the bird go to the two habitat?
+ggplot(data = movepath_df, aes(x = as.factor(hab), fill = as.factor(sim_num))) +
+  geom_bar(stat="count", show.legend = TRUE) +
+  geom_text(aes(label = after_stat(count)), stat = "count", position = position_stack(vjust = 0.5)) +
+  labs(title = "habitat where birds went")
+
+#stacked map of where seeds where dispersed
+ggplot() +
+  geom_raster(data = test_df, aes(x = x, y = y, fill = as.factor(hab)), alpha = 0.7) + 
+  scale_fill_manual(values = c("white", "forestgreen")) +
+  new_scale_fill() +  # Allows adding a new fill scale
+  geom_point(data = movepath_df, aes(x = x_, y = y_, col = as.factor(sim_num)), size = 2) +
+  stat_chull(data = movepath_df, aes(x = x_, y = y_, col = as.factor(sim_num), alpha = 0.4), geom = "polygon", alpha = 0.6) + 
+  labs(title = "Map of bird min. convex hull")
+
+
+#SDD  ***********************************************
+sdd_out_list
+sdd_out_df <- rbindlist(sdd_out_list, fill=TRUE) 
+as.numeric(sdd_out_df$distances) -> sdd_out_df$distances
+
+#where were the seeds deposited?
+ggplot(data = sdd_out_df, aes(x = as.factor(hab_depo), fill = as.factor(sim_num))) +
+  geom_bar(stat="count", show.legend = TRUE) +
+  geom_text(aes(label = after_stat(count)), stat = "count", position = position_stack(vjust = 0.5)) +
+  labs(title = "habitat where seeds were deposited")
+
+#stacked histogram by habitat
+ggplot(data = sdd_out_df, aes(x = as.numeric(distances), fill = as.factor(hab_depo))) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.5, position = "dodge", bins = 8) + 
+  geom_density(alpha = 0.6) +
+  xlim(0, 1000) +
+  labs(title = "seed dispersal distances")
+
+#stacked histogram by simulation
+ggplot(data = sdd_out_df, aes(x = as.numeric(distances), fill = as.factor(sim_num))) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.5, position = "dodge", bins = 8) + 
+  geom_density(alpha = 0.6) +
+    labs(title = "seed dispersal distances")
+
+#stacked map of where seeds where dispersed
+ggplot() +
+  geom_raster(data = test_df, aes(x = x, y = y, fill = as.factor(hab)), alpha = 0.7) + 
+  scale_fill_manual(values = c("white", "forestgreen")) +
+  new_scale_fill() +  # Allows adding a new fill scale
+  geom_point(data = sdd_out_df, aes(x = x_depo, y = y_depo, col = as.factor(sim_num)), size = 2) +
+  stat_chull(data = sdd_out_df, aes(x = x_depo, y = y_depo, col = as.factor(sim_num), alpha = 0.4), geom = "polygon", alpha = 0.6) + 
+  labs(title = "Map of seeds deposited")
+
+
+#analysis
+ggplot( data = sdd_out_df, aes(x=percent_tree, y= total_seeds_depo)) +
+  geom_point( aes(col=as.factor(sim_num) )) +
+  geom_smooth(method = "lm", se = TRUE) 
+
+sdd_out_df %>%
+  group_by(sim_num, percent_tree) %>%
+  summarize(mean_sdd = mean(distances), n_seed_dispersed = max(total_seeds_depo), p_seed_inforest = sum(hab_depo)/n_seed_dispersed ,
+          unique_tree = n_distinct(origintree_ID)) -> sdd_out_df_results
+  
+ggplot( data = sdd_out_df_results, aes(x=as.factor(percent_tree), y=unique_tree )) +
+  geom_boxplot() +
+  geom_jitter() # +
+  geom_smooth(method = "lm", se = TRUE) 
+
+ggplot( data = sdd_out_df_results, aes(x=as.factor(percent_tree), y=unique_tree)) +
+  geom_boxplot() +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) 
+
+ggplot( data = sdd_out_df_results, aes(x=percent_tree, y=p_seed_inforest )) +
+  # geom_jitter( aes(col=as.factor(sim_num)), width = 0.05) +
+  geom_boxplot( aes(col=as.factor(sim_num)), width = 0.05) +
+  #geom_jitter() +
+  geom_smooth(method = "lm", se = TRUE) 
+
+```
+
+
